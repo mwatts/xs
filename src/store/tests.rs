@@ -16,6 +16,7 @@ mod tests_ensure {
 mod tests_read_options {
     use super::*;
 
+    #[cfg(any(feature = "nu", feature = "server"))]
     #[derive(Debug)]
     struct TestCase<'a> {
         input: Option<&'a str>,
@@ -58,6 +59,7 @@ mod tests_read_options {
         );
     }
 
+    #[cfg(any(feature = "nu", feature = "server"))]
     #[test]
     fn test_read_options_from_query() {
         let test_cases = [
@@ -428,6 +430,7 @@ mod tests_ttl {
         assert_eq!(serialized, r#""time:1000""#);
     }
 
+    #[cfg(any(feature = "nu", feature = "server"))]
     #[test]
     fn test_to_query() {
         assert_eq!(TTL::Forever.to_query(), "ttl=forever");
@@ -455,6 +458,7 @@ mod tests_ttl {
         assert!(parse_ttl("unknown").is_err());
     }
 
+    #[cfg(any(feature = "nu", feature = "server"))]
     #[test]
     fn test_from_query() {
         assert_eq!(TTL::from_query(None), Ok(TTL::Forever));
@@ -471,6 +475,7 @@ mod tests_ttl {
         assert!(TTL::from_query(Some("ttl=invalid")).is_err()); // Invalid type
     }
 
+    #[cfg(any(feature = "nu", feature = "server"))]
     #[test]
     fn test_ttl_round_trip() {
         let ttls = vec![

@@ -1,3 +1,4 @@
+pub mod engine;
 mod ttl;
 pub use ttl::*;
 
@@ -115,6 +116,7 @@ pub struct ReadOptions {
 }
 
 impl ReadOptions {
+    #[cfg(any(feature = "nu", feature = "server"))]
     pub fn from_query(query: Option<&str>) -> Result<Self, crate::error::Error> {
         match query {
             Some(q) => Ok(serde_urlencoded::from_str(q)?),
@@ -122,6 +124,7 @@ impl ReadOptions {
         }
     }
 
+    #[cfg(any(feature = "nu", feature = "server"))]
     pub fn to_query_string(&self) -> String {
         let mut params = Vec::new();
 
@@ -531,6 +534,7 @@ impl Store {
     ///
     /// Scans all frames up to (and including) `as_of` and returns a mapping of
     /// topic name to CAS hash for the latest frame on each `*.nu` topic.
+    #[cfg(feature = "nu")]
     pub fn nu_modules_at(
         &self,
         as_of: &Scru128Id,

@@ -300,6 +300,57 @@ pub async fn version(addr: &str) -> Result<Bytes, Box<dyn std::error::Error + Se
     }
 }
 
+pub async fn compact(
+    addr: &str,
+    before: Option<&str>,
+    before_timestamp: Option<&str>,
+    topic: Option<&str>,
+    _dry_run: bool,
+) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    let mut query_parts = Vec::new();
+    if let Some(b) = before {
+        query_parts.push(format!("before={b}"));
+    }
+    if let Some(ts) = before_timestamp {
+        query_parts.push(format!("before_timestamp={ts}"));
+    }
+    if let Some(t) = topic {
+        query_parts.push(format!("topic={t}"));
+    }
+    let query = if query_parts.is_empty() {
+        None
+    } else {
+        Some(query_parts.join("&"))
+    };
+
+    let res = request::request(
+        addr,
+        Method::POST,
+        "compact",
+        query.as_deref(),
+        empty(),
+        None,
+    )
+    .await?;
+    let body = res.collect().await?.to_bytes();
+    Ok(body)
+}
+
+pub async fn snapshot(addr: &str) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    let res = request::request(addr, Method::GET, "snapshot", None, empty(), None).await?;
+    let body = res.collect().await?.to_bytes();
+    Ok(body)
+}
+
+pub async fn gc_cas(
+    addr: &str,
+    _dry_run: bool,
+) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    let res = request::request(addr, Method::POST, "gc/cas", None, empty(), None).await?;
+    let body = res.collect().await?.to_bytes();
+    Ok(body)
+}
+
 fn empty() -> BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>> {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})

@@ -198,6 +198,45 @@ export def .eval [
   }
 }
 
+# Compact the store by removing old frames
+export def .compact [
+  --before: string # Compact frames before this SCRU128 ID (exclusive)
+  --before-timestamp: string # Compact frames older than this ISO8601 timestamp
+  --topic: string # Restrict compaction to a specific topic
+  --dry-run # Report what would be removed without actually removing
+] {
+  let args = [
+    (if $before != null { ["--before" $before] })
+    (if $before_timestamp != null { ["--before-timestamp" $before_timestamp] })
+    (if $topic != null { ["--topic" $topic] })
+    (if $dry_run { ["--dry-run"] })
+  ] | compact | flatten
+
+  xs compact (xs-addr) ...$args | from json
+}
+
+# Export a snapshot of the latest frame per topic as NDJSON
+export def .snapshot [
+  --output (-o): string # Output file path (default: stdout)
+] {
+  if $output != null {
+    xs snapshot (xs-addr) --output $output
+  } else {
+    xs snapshot (xs-addr) | lines | each { from json }
+  }
+}
+
+# Remove orphaned CAS content not referenced by any frame
+export def .gc-cas [
+  --dry-run # Report orphans without removing
+] {
+  let args = [
+    (if $dry_run { ["--dry-run"] })
+  ] | compact | flatten
+
+  xs gc-cas (xs-addr) ...$args | from json
+}
+
 # Generate a new SCRU128 ID
 export def .id [] {
   xs scru128

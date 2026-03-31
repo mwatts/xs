@@ -1019,3 +1019,182 @@ fn test_read_sync_limit_with_topic() {
     let frames: Vec<_> = store.read_sync(options).collect();
     assert_eq!(vec![a1, a2], frames);
 }
+
+mod tests_compact {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_compact_by_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::new(temp_dir.path().to_path_buf()).unwrap();
+
+        // Append 10 frames
+        let mut frames = Vec::new();
+        for _ in 0..10 {
+            frames.push(store.append(Frame::builder("data").build()).unwrap());
+        }
+
+        // Compact before frame 5 (index 4)
+        let boundary = frames[4].id;
+        let result = store.compact(boundary, None).await;
+
+        assert_eq!(result.frames_removed, 4);
+        assert_eq!(result.boundary_id, boundary);
+
+        // Verify only frames 5-10 remain (plus xs.compacted)
+        let remaining: Vec<Frame> = store.read_sync(ReadOptions::builder().build()).collect();
+
+        // Should have frames[4..10] + xs.start (from store creation, if any) + xs.compacted
+        let data_frames: Vec<&Frame> = remaining.iter().filter(|f| f.topic == "data").collect();
+        assert_eq!(data_frames.len(), 6);
+        assert_eq!(data_frames[0].id, frames[4].id);
+
+        // Verify xs.compacted frame exists
+        let compacted: Vec<&Frame> = remaining
+            .iter()
+            .filter(|f| f.topic == "xs.compacted")
+            .collect();
+        assert_eq!(compacted.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_compact_by_topic() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let a1 = store.append(Frame::builder("topic.a").build()).unwrap();
+        let b1 = store.append(Frame::builder("topic.b").build()).unwrap();
+        let a2 = store.append(Frame::builder("topic.a").build()).unwrap();
+        let b2 = store.append(Frame::builder("topic.b").build()).unwrap();
+
+        // Compact topic.a before a2 (should remove a1 only)
+        let result = store.compact(a2.id, Some("topic.a".to_string())).await;
+        assert_eq!(result.frames_removed, 1);
+
+        // topic.b should be untouched
+        let b_frames: Vec<Frame> = store
+            .read_sync(ReadOptions::builder().topic("topic.b".to_string()).build())
+            .collect();
+        assert_eq!(b_frames.len(), 2);
+        assert_eq!(b_frames[0].id, b1.id);
+        assert_eq!(b_frames[1].id, b2.id);
+
+        // topic.a should have only a2
+        let a_frames: Vec<Frame> = store
+            .read_sync(ReadOptions::builder().topic("topic.a".to_string()).build())
+            .collect();
+        assert_eq!(a_frames.len(), 1);
+        assert_eq!(a_frames[0].id, a2.id);
+    }
+
+    #[tokio::test]
+    async fn test_compact_preserves_system_frames() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::new(temp_dir.path().to_path_buf()).unwrap();
+
+        // xs.start is already appended by tests that use serve,
+        // but Store::new does not append it. Manually add one.
+        let sys = store.append(Frame::builder("xs.test").build()).unwrap();
+        let data = store.append(Frame::builder("data").build()).unwrap();
+
+        // Compact everything before a future boundary
+        let future_id = scru128::new();
+        let result = store.compact(future_id, None).await;
+
+        // data frame should be removed, xs.test should remain
+        assert_eq!(result.frames_removed, 1);
+
+        let remaining: Vec<Frame> = store.read_sync(ReadOptions::builder().build()).collect();
+        let sys_frames: Vec<&Frame> = remaining
+            .iter()
+            .filter(|f| f.topic.starts_with("xs."))
+            .collect();
+        // xs.test + xs.compacted
+        assert!(sys_frames.len() >= 2);
+        assert!(sys_frames.iter().any(|f| f.id == sys.id));
+
+        // data frame should be gone
+        assert!(!remaining.iter().any(|f| f.id == data.id));
+    }
+
+    #[tokio::test]
+    async fn test_compact_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::new(temp_dir.path().to_path_buf()).unwrap();
+
+        for _ in 0..5 {
+            store.append(Frame::builder("data").build()).unwrap();
+        }
+
+        let boundary = scru128::new();
+
+        let result1 = store.compact(boundary, None).await;
+        assert_eq!(result1.frames_removed, 5);
+
+        // Second compact with same boundary should be a no-op
+        let result2 = store.compact(boundary, None).await;
+        assert_eq!(result2.frames_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_cas_orphans() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::new(temp_dir.path().to_path_buf()).unwrap();
+
+        // Insert CAS content and create frames referencing it
+        let hash1 = store.cas_insert_sync(b"content1").unwrap();
+        let hash2 = store.cas_insert_sync(b"content2").unwrap();
+
+        let f1 = store
+            .append(Frame::builder("data").hash(hash1.clone()).build())
+            .unwrap();
+        let _f2 = store
+            .append(Frame::builder("data").hash(hash2.clone()).build())
+            .unwrap();
+
+        // Remove f1 to orphan hash1
+        store.remove(&f1.id).unwrap();
+
+        // GC should remove hash1 but keep hash2
+        let removed = store.gc_cas_orphans().await;
+        assert_eq!(removed, 1);
+
+        // hash2 should still be readable
+        assert!(store.cas_read_sync(&hash2).is_ok());
+
+        // hash1 should be gone
+        assert!(store.cas_read_sync(&hash1).is_err());
+    }
+
+    #[test]
+    fn test_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::new(temp_dir.path().to_path_buf()).unwrap();
+
+        // Append multiple frames to same topic (only latest should appear)
+        let _old = store.append(Frame::builder("topic.a").build()).unwrap();
+        let latest_a = store.append(Frame::builder("topic.a").build()).unwrap();
+        let latest_b = store.append(Frame::builder("topic.b").build()).unwrap();
+
+        let mut buf = Vec::new();
+        let count = store.snapshot(&mut buf).unwrap();
+
+        // Should have 2 frames (latest per topic)
+        assert_eq!(count, 2);
+
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        // Parse and verify
+        let frames: Vec<Frame> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let ids: Vec<_> = frames.iter().map(|f| f.id).collect();
+        assert!(ids.contains(&latest_a.id));
+        assert!(ids.contains(&latest_b.id));
+    }
+}

@@ -185,10 +185,27 @@ pub enum FollowOption {
     WithHeartbeat(Duration),
 }
 
+#[derive(Debug, Serialize)]
+pub struct CompactResult {
+    pub frames_removed: u64,
+    pub boundary_id: Scru128Id,
+}
+
 #[derive(Debug)]
 enum GCTask {
     Remove(Scru128Id),
-    CheckLastTTL { topic: String, keep: u32 },
+    CheckLastTTL {
+        topic: String,
+        keep: u32,
+    },
+    Compact {
+        before: Scru128Id,
+        topic: Option<String>,
+        response: tokio::sync::oneshot::Sender<CompactResult>,
+    },
+    GcCas {
+        response: tokio::sync::oneshot::Sender<u64>,
+    },
     Drain(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -620,6 +637,142 @@ impl Store {
         self.cas_insert_sync(bytes)
     }
 
+    /// Compact the store by removing frames older than `before`.
+    /// Optionally restrict to a specific topic. System frames (xs.*) are never removed.
+    /// Returns the result asynchronously via the GC worker.
+    pub async fn compact(&self, before: Scru128Id, topic: Option<String>) -> CompactResult {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.gc_tx.send(GCTask::Compact {
+            before,
+            topic,
+            response: tx,
+        });
+        rx.await.unwrap()
+    }
+
+    /// Perform compaction synchronously on the calling thread.
+    /// Called from the GC worker.
+    fn compact_sync(&self, before: Scru128Id, topic: Option<String>) -> CompactResult {
+        // Collect IDs to remove under the append lock (scan only)
+        let ids_to_remove: Vec<Scru128Id> = {
+            let _guard = self.append_lock.lock().unwrap();
+
+            let iter: Box<dyn Iterator<Item = Frame>> = match topic.as_deref() {
+                None | Some("*") => self.iter_frames(None),
+                Some(t) => self.iter_frames_by_topic(t, None),
+            };
+
+            iter.filter(|frame| frame.id < before && !frame.topic.starts_with("xs."))
+                .map(|frame| frame.id)
+                .collect()
+        };
+
+        let frames_removed = ids_to_remove.len() as u64;
+
+        // Remove each frame outside the append lock
+        for id in &ids_to_remove {
+            let _ = self.remove(id);
+        }
+
+        // Append xs.compacted marker
+        let meta = serde_json::json!({
+            "before": before.to_string(),
+            "topic": topic,
+            "frames_removed": frames_removed,
+        });
+        let _ = self.append(Frame::builder("xs.compacted").meta(meta).build());
+
+        CompactResult {
+            frames_removed,
+            boundary_id: before,
+        }
+    }
+
+    /// Write a snapshot of the store as NDJSON to the given writer.
+    /// Keeps only the latest frame per topic.
+    /// Returns the number of frames written.
+    pub fn snapshot(&self, writer: &mut impl std::io::Write) -> Result<u64, crate::error::Error> {
+        let mut latest: std::collections::HashMap<String, Frame> = std::collections::HashMap::new();
+
+        let options = ReadOptions::builder().follow(FollowOption::Off).build();
+        for frame in self.read_sync(options) {
+            latest.insert(frame.topic.clone(), frame);
+        }
+
+        let mut count = 0u64;
+        // Sort by ID for deterministic output
+        let mut frames: Vec<Frame> = latest.into_values().collect();
+        frames.sort_by_key(|f| f.id);
+
+        for frame in &frames {
+            let line = serde_json::to_string(frame).unwrap();
+            writeln!(writer, "{}", line)?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Remove orphaned CAS entries not referenced by any frame.
+    /// Returns the number of entries removed.
+    pub async fn gc_cas_orphans(&self) -> u64 {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.gc_tx.send(GCTask::GcCas { response: tx });
+        rx.await.unwrap()
+    }
+
+    /// Perform CAS GC synchronously on the calling thread.
+    ///
+    /// Walks the cacache content-v2 directory to find all stored content,
+    /// compares against hashes referenced by current frames, and removes
+    /// orphaned content files.
+    fn gc_cas_orphans_sync(&self) -> u64 {
+        // Collect all referenced hashes as ssri strings
+        let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let options = ReadOptions::builder().follow(FollowOption::Off).build();
+        for frame in self.read_sync(options) {
+            if let Some(hash) = &frame.hash {
+                referenced.insert(hash.to_string());
+            }
+        }
+
+        // Walk content-v2 directory to find all stored content files.
+        // Structure: content-v2/<algo>/<hex[0:2]>/<hex[2:4]>/<hex[4:]>
+        let cas_path = self.path.join("cacache");
+        let content_dir = cas_path.join("content-v2");
+        let mut removed = 0u64;
+
+        if !content_dir.exists() {
+            return 0;
+        }
+
+        for file_path in walk_content_files(&content_dir) {
+            // Reconstruct the integrity hash from the file path
+            if let Some(integrity) = integrity_from_content_path(&content_dir, &file_path) {
+                let sri_str = integrity.to_string();
+                if !referenced.contains(&sri_str) {
+                    // Double-check: re-scan to handle races with concurrent appends
+                    let still_orphaned = {
+                        let options = ReadOptions::builder().follow(FollowOption::Off).build();
+                        !self.read_sync(options).any(|f| {
+                            f.hash.as_ref().map(|h| h.to_string()) == Some(sri_str.clone())
+                        })
+                    };
+
+                    if still_orphaned {
+                        // Remove the content file directly
+                        if std::fs::remove_file(&file_path).is_ok() {
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        removed
+    }
+
     pub async fn cas_read(&self, hash: &ssri::Integrity) -> cacache::Result<Vec<u8>> {
         cacache::read_hash(&self.path.join("cacache"), hash).await
     }
@@ -825,6 +978,20 @@ fn spawn_gc_worker(mut gc_rx: UnboundedReceiver<GCTask>, store: Store) {
                     }
                 }
 
+                GCTask::Compact {
+                    before,
+                    topic,
+                    response,
+                } => {
+                    let result = store.compact_sync(before, topic);
+                    let _ = response.send(result);
+                }
+
+                GCTask::GcCas { response } => {
+                    let result = store.gc_cas_orphans_sync();
+                    let _ = response.send(result);
+                }
+
                 GCTask::Drain(tx) => {
                     let _ = tx.send(());
                 }
@@ -842,6 +1009,91 @@ fn is_expired(id: &Scru128Id, ttl: &Duration) -> bool {
         .as_millis() as u64;
 
     now_ms >= expires_ms
+}
+
+/// Walk all content files in the cacache content-v2 directory.
+fn walk_content_files(content_dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(algo_dirs) = std::fs::read_dir(content_dir) else {
+        return files;
+    };
+    for algo_entry in algo_dirs.flatten() {
+        if !algo_entry.path().is_dir() {
+            continue;
+        }
+        let Ok(d1_dirs) = std::fs::read_dir(algo_entry.path()) else {
+            continue;
+        };
+        for d1_entry in d1_dirs.flatten() {
+            if !d1_entry.path().is_dir() {
+                continue;
+            }
+            let Ok(d2_dirs) = std::fs::read_dir(d1_entry.path()) else {
+                continue;
+            };
+            for d2_entry in d2_dirs.flatten() {
+                if !d2_entry.path().is_dir() {
+                    continue;
+                }
+                let Ok(leaf_files) = std::fs::read_dir(d2_entry.path()) else {
+                    continue;
+                };
+                for file_entry in leaf_files.flatten() {
+                    if file_entry.path().is_file() {
+                        files.push(file_entry.path());
+                    }
+                }
+            }
+        }
+    }
+    files
+}
+
+/// Reconstruct an ssri::Integrity from a cacache content-v2 file path.
+/// Path structure: content-v2/<algo>/<hex[0:2]>/<hex[2:4]>/<hex[4:]>
+fn integrity_from_content_path(
+    content_dir: &std::path::Path,
+    file_path: &std::path::Path,
+) -> Option<ssri::Integrity> {
+    let relative = file_path.strip_prefix(content_dir).ok()?;
+    let components: Vec<&str> = relative
+        .components()
+        .map(|c| c.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?;
+    if components.len() != 4 {
+        return None;
+    }
+    let algo = components[0];
+    let hex = format!("{}{}{}", components[1], components[2], components[3]);
+
+    // Convert hex to bytes, then to base64
+    let bytes = hex_to_bytes(&hex)?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+    let sri_str = format!("{algo}-{b64}");
+    sri_str.parse::<ssri::Integrity>().ok()
+}
+
+/// Simple hex string to bytes conversion (no external dependency needed).
+fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks(2) {
+        let high = hex_digit(chunk[0])?;
+        let low = hex_digit(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Some(bytes)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 const NULL_DELIMITER: u8 = 0;

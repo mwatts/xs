@@ -57,6 +57,12 @@ enum Command {
     Scru128(CommandScru128),
     /// Evaluate a Nushell script with store helper commands available
     Eval(CommandEval),
+    /// Compact the store by removing old frames
+    Compact(CommandCompact),
+    /// Export a snapshot of the latest frame per topic
+    Snapshot(CommandSnapshot),
+    /// Remove orphaned CAS content
+    GcCas(CommandGcCas),
 }
 
 #[derive(Parser, Debug)]
@@ -239,6 +245,51 @@ struct CommandEval {
     commands: Option<String>,
 }
 
+#[derive(Parser, Debug)]
+struct CommandCompact {
+    /// Address to connect to [HOST]:PORT or <PATH> for Unix domain socket
+    #[clap(value_parser)]
+    addr: String,
+
+    /// Compact frames before this SCRU128 ID (exclusive)
+    #[clap(long)]
+    before: Option<String>,
+
+    /// Compact frames older than this ISO8601 timestamp
+    #[clap(long)]
+    before_timestamp: Option<String>,
+
+    /// Restrict compaction to a specific topic
+    #[clap(long, value_parser = parse_topic)]
+    topic: Option<String>,
+
+    /// Report what would be removed without actually removing
+    #[clap(long)]
+    dry_run: bool,
+}
+
+#[derive(Parser, Debug)]
+struct CommandSnapshot {
+    /// Address to connect to [HOST]:PORT or <PATH> for Unix domain socket
+    #[clap(value_parser)]
+    addr: String,
+
+    /// Output file path (default: stdout)
+    #[clap(long, short = 'o')]
+    output: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+struct CommandGcCas {
+    /// Address to connect to [HOST]:PORT or <PATH> for Unix domain socket
+    #[clap(value_parser)]
+    addr: String,
+
+    /// Report orphans without removing
+    #[clap(long)]
+    dry_run: bool,
+}
+
 fn extract_addr_from_command(command: &Command) -> Option<String> {
     match command {
         Command::Cat(cmd) => Some(cmd.addr.clone()),
@@ -251,6 +302,9 @@ fn extract_addr_from_command(command: &Command) -> Option<String> {
         Command::Import(cmd) => Some(cmd.addr.clone()),
         Command::Version(cmd) => Some(cmd.addr.clone()),
         Command::Eval(cmd) => Some(cmd.addr.clone()),
+        Command::Compact(cmd) => Some(cmd.addr.clone()),
+        Command::Snapshot(cmd) => Some(cmd.addr.clone()),
+        Command::GcCas(cmd) => Some(cmd.addr.clone()),
         Command::Serve(_) | Command::Nu(_) | Command::Scru128(_) => None,
     }
 }
@@ -285,6 +339,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Import(args) => import(args).await,
         Command::Version(args) => version(args).await,
         Command::Eval(args) => eval(args).await,
+        Command::Compact(args) => compact(args).await,
+        Command::Snapshot(args) => snapshot(args).await,
+        Command::GcCas(args) => gc_cas(args).await,
         Command::Nu(args) => run_nu(args),
         Command::Scru128(args) => run_scru128(args),
     };
@@ -871,6 +928,41 @@ fn clean() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::fs::remove_file(t)?;
         println!("removed {}", t.display());
     }
+    Ok(())
+}
+
+async fn compact(args: CommandCompact) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = xs::client::compact(
+        &args.addr,
+        args.before.as_deref(),
+        args.before_timestamp.as_deref(),
+        args.topic.as_deref(),
+        args.dry_run,
+    )
+    .await?;
+    tokio::io::stdout().write_all(&response).await?;
+    println!();
+    Ok(())
+}
+
+async fn snapshot(args: CommandSnapshot) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = xs::client::snapshot(&args.addr).await?;
+    match args.output {
+        Some(path) => {
+            tokio::fs::write(&path, &response).await?;
+            eprintln!("Snapshot written to {}", path.display());
+        }
+        None => {
+            tokio::io::stdout().write_all(&response).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn gc_cas(args: CommandGcCas) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = xs::client::gc_cas(&args.addr, args.dry_run).await?;
+    tokio::io::stdout().write_all(&response).await?;
+    println!();
     Ok(())
 }
 

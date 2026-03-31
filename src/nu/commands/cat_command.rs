@@ -60,6 +60,7 @@ impl Command for CatCommand {
         "Reads the event stream and returns frames"
     }
 
+    #[allow(clippy::result_large_err)]
     fn run(
         &self,
         engine_state: &EngineState,

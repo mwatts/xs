@@ -76,6 +76,13 @@ enum Routes {
     CasPost,
     Import,
     Eval,
+    Compact {
+        before: Option<String>,
+        before_timestamp: Option<String>,
+        topic: Option<String>,
+    },
+    Snapshot,
+    GcCas,
     Version,
     NotFound,
     BadRequest(String),
@@ -181,6 +188,14 @@ fn match_route(
         (&Method::POST, "/import") => Routes::Import,
         (&Method::POST, "/eval") => Routes::Eval,
 
+        (&Method::POST, "/compact") => Routes::Compact {
+            before: params.get("before").cloned(),
+            before_timestamp: params.get("before_timestamp").cloned(),
+            topic: params.get("topic").cloned(),
+        },
+        (&Method::GET, "/snapshot") => Routes::Snapshot,
+        (&Method::POST, "/gc/cas") => Routes::GcCas,
+
         (&Method::GET, p) => match Scru128Id::from_str(p.trim_start_matches('/')) {
             Ok(id) => {
                 let with_timestamp = params.contains_key("with-timestamp");
@@ -268,6 +283,16 @@ async fn handle(
         Routes::Import => handle_import(&mut store, req.into_body()).await,
 
         Routes::Eval => handle_eval(&store, req.into_body()).await,
+
+        Routes::Compact {
+            before,
+            before_timestamp,
+            topic,
+        } => handle_compact(&mut store, before, before_timestamp, topic).await,
+
+        Routes::Snapshot => handle_snapshot(&store),
+
+        Routes::GcCas => handle_gc_cas(&store).await,
 
         Routes::NotFound => response_404(),
         Routes::BadRequest(msg) => response_400(msg),
@@ -631,6 +656,60 @@ fn empty() -> BoxBody<Bytes, BoxError> {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
+}
+
+async fn handle_compact(
+    store: &mut Store,
+    before: Option<String>,
+    before_timestamp: Option<String>,
+    topic: Option<String>,
+) -> HTTPResult {
+    let before_id = match (before, before_timestamp) {
+        (Some(id_str), _) => match Scru128Id::from_str(&id_str) {
+            Ok(id) => id,
+            Err(e) => return response_400(format!("Invalid before ID: {e}")),
+        },
+        (None, Some(ts_str)) => {
+            let dt: DateTime<Utc> = match ts_str.parse() {
+                Ok(dt) => dt,
+                Err(e) => return response_400(format!("Invalid timestamp: {e}")),
+            };
+            let millis = dt.timestamp_millis() as u64;
+            // Create a synthetic Scru128Id at this timestamp boundary
+            Scru128Id::from_fields(millis, 0, 0, 0)
+        }
+        (None, None) => {
+            return response_400("Must provide 'before' or 'before_timestamp'".to_string())
+        }
+    };
+
+    let result = store.compact(before_id, topic).await;
+    let json = serde_json::to_string(&result).unwrap();
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(full(json))?)
+}
+
+fn handle_snapshot(store: &Store) -> HTTPResult {
+    let mut buf = Vec::new();
+    match store.snapshot(&mut buf) {
+        Ok(_count) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/x-ndjson")
+            .body(full(buf))?),
+        Err(e) => response_500(format!("Snapshot failed: {e}")),
+    }
+}
+
+async fn handle_gc_cas(store: &Store) -> HTTPResult {
+    let removed = store.gc_cas_orphans().await;
+    let json = serde_json::json!({"orphans_removed": removed});
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(full(serde_json::to_string(&json).unwrap()))?)
 }
 
 async fn handle_eval(store: &Store, body: hyper::body::Incoming) -> HTTPResult {

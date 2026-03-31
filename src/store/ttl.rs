@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -15,6 +14,7 @@ pub enum TTL {
 
 impl TTL {
     /// Converts a `TTL` into its query string representation.
+    #[cfg(any(feature = "nu", feature = "server"))]
     pub fn to_query(&self) -> String {
         match self {
             TTL::Forever => "ttl=forever".to_string(),
@@ -25,7 +25,10 @@ impl TTL {
     }
 
     /// Parses a `TTL` from a query string.
+    #[cfg(any(feature = "nu", feature = "server"))]
     pub fn from_query(query: Option<&str>) -> Result<Self, String> {
+        use std::collections::HashMap;
+
         // Parse query string into key-value pairs
         let params = match query {
             None => return Ok(TTL::default()), // Use default TTL if query is None

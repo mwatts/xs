@@ -249,6 +249,18 @@ impl Actor {
                 continue;
             }
 
+            if frame.topic == "xs.stopping" {
+                let _ = store.append(
+                    Frame::builder(format!("{topic}.unregistered", topic = &self.topic))
+                        .meta(serde_json::json!({
+                            "actor_id": self.id.to_string(),
+                            "reason": "shutdown",
+                        }))
+                        .build(),
+                );
+                break;
+            }
+
             if frame.topic == format!("{topic}.register", topic = &self.topic)
                 || frame.topic == format!("{topic}.unregister", topic = &self.topic)
             {

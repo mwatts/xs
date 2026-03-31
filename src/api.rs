@@ -423,6 +423,7 @@ pub async fn serve(
     store: Store,
     engine: nu::Engine,
     expose: Option<String>,
+    token: tokio_util::sync::CancellationToken,
 ) -> Result<(), BoxError> {
     let path = store.path.join("sock").to_string_lossy().to_string();
     let listener = Listener::bind(&path).await?;
@@ -447,18 +448,17 @@ pub async fn serve(
         tracing::error!("Failed to append xs.start frame: {}", e);
     }
 
-    let mut tasks = Vec::new();
+    let mut tasks = tokio::task::JoinSet::new();
     for listener in listeners {
         let store = store.clone();
         let engine = engine.clone();
-        let task = tokio::spawn(async move { listener_loop(listener, store, engine).await });
-        tasks.push(task);
+        let token = token.clone();
+        tasks.spawn(async move { listener_loop(listener, store, engine, token).await });
     }
 
-    // TODO: graceful shutdown and error handling
-    // Wait for all listener tasks to complete (or until the first error)
-    for task in tasks {
-        task.await??;
+    // Wait for all listener tasks to complete
+    while let Some(result) = tasks.join_next().await {
+        result??;
     }
 
     Ok(())
@@ -468,34 +468,44 @@ async fn listener_loop(
     mut listener: Listener,
     store: Store,
     engine: nu::Engine,
+    token: tokio_util::sync::CancellationToken,
 ) -> Result<(), BoxError> {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let store = store.clone();
-        let engine = engine.clone();
-        tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(
-                    io,
-                    service_fn(move |req| handle(store.clone(), engine.clone(), req)),
-                )
-                .await
-            {
-                // Match against the error kind to selectively ignore `NotConnected` errors
-                if let Some(std::io::ErrorKind::NotConnected) = err.source().and_then(|source| {
-                    source
-                        .downcast_ref::<std::io::Error>()
-                        .map(|io_err| io_err.kind())
-                }) {
-                    // ignore the NotConnected error, hyper's way of saying the client disconnected
-                } else {
-                    // todo, Handle or log other errors
-                    tracing::error!("TBD: {:?}", err);
-                }
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => break,
+            result = listener.accept() => {
+                let (stream, _) = result?;
+                let io = TokioIo::new(stream);
+                let store = store.clone();
+                let engine = engine.clone();
+                connections.spawn(async move {
+                    if let Err(err) = http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            service_fn(move |req| handle(store.clone(), engine.clone(), req)),
+                        )
+                        .await
+                    {
+                        if let Some(std::io::ErrorKind::NotConnected) = err.source().and_then(|source| {
+                            source
+                                .downcast_ref::<std::io::Error>()
+                                .map(|io_err| io_err.kind())
+                        }) {
+                            // ignore NotConnected: client disconnected
+                        } else {
+                            tracing::error!("TBD: {:?}", err);
+                        }
+                    }
+                });
             }
-        });
+        }
     }
+
+    // Drain in-flight connections
+    while connections.join_next().await.is_some() {}
+    Ok(())
 }
 
 fn response_frame_or_404(frame: Option<store::Frame>, with_timestamp: bool) -> HTTPResult {

@@ -6,11 +6,14 @@ use clap::{Parser, Subcommand};
 use dirs::config_dir;
 
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
 use xs::nu;
 use xs::store::{
     parse_ttl, validate_topic, validate_topic_query, FollowOption, ReadOptions, Store, StoreError,
 };
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn parse_topic(s: &str) -> Result<String, String> {
     validate_topic(s).map_err(|e| e.to_string())?;
@@ -336,22 +339,23 @@ async fn serve(args: CommandServe) -> Result<(), Box<dyn std::error::Error + Sen
         Err(e) => return Err(e.into()),
     };
     let engine = nu::Engine::new()?;
+    let token = CancellationToken::new();
 
-    {
+    let log_handle = {
         let store = store.clone();
         tokio::spawn(async move {
             let _ = xs::trace::log_stream(store).await;
-        });
-    }
+        })
+    };
 
-    {
+    let actor_handle = {
         let store = store.clone();
         tokio::spawn(async move {
             if let Err(e) = xs::processor::actor::run(store).await {
                 eprintln!("Actor processor error: {e}");
             }
-        });
-    }
+        })
+    };
 
     let service_handle = {
         let store = store.clone();
@@ -362,24 +366,71 @@ async fn serve(args: CommandServe) -> Result<(), Box<dyn std::error::Error + Sen
         })
     };
 
-    {
+    let action_handle = {
         let store = store.clone();
         tokio::spawn(async move {
             if let Err(e) = xs::processor::action::run(store).await {
                 eprintln!("Action processor error: {e}");
             }
-        });
-    }
+        })
+    };
 
-    tokio::select! {
-        res = xs::api::serve(store.clone(), engine.clone(), args.expose) => { res?; }
-        _ = tokio::signal::ctrl_c() => {}
-    }
+    let api_handle = {
+        let store = store.clone();
+        let engine = engine.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = xs::api::serve(store, engine, args.expose, token).await {
+                eprintln!("API server error: {e}");
+            }
+        })
+    };
 
+    // Wait for shutdown signal
+    wait_for_shutdown_signal().await;
+
+    // Phase 1: signal processors and cancel listener accept loops
     store.append(xs::store::Frame::builder("xs.stopping").build())?;
-    let _ = tokio::time::timeout(Duration::from_secs(3), service_handle).await;
+    token.cancel();
+
+    // Phase 2: drain processors with timeout
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+        let _ = api_handle.await;
+        let _ = service_handle.await;
+        let _ = action_handle.await;
+        let _ = actor_handle.await;
+        let _ = log_handle.await;
+    })
+    .await;
+
+    // Phase 4: flush and close
+    store.append(xs::store::Frame::builder("xs.stop").build())?;
+    store.wait_for_gc().await;
+
+    // Clean up Unix socket file
+    let sock_path = args.path.join("sock");
+    if sock_path.exists() {
+        let _ = std::fs::remove_file(&sock_path);
+    }
 
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+    }
 }
 
 async fn cat(args: CommandCat) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

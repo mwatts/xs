@@ -69,6 +69,10 @@ pub async fn run(store: Store) -> Result<(), Box<dyn std::error::Error + Send + 
                 }
             }
             Lifecycle::Live(frame) => {
+                if frame.topic == "xs.stopping" {
+                    break;
+                }
+
                 if let Some(topic) = frame.topic.strip_suffix(".register") {
                     start_actor(&frame, &store, topic).await?;
                 }

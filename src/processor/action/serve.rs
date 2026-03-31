@@ -240,6 +240,7 @@ pub async fn run(store: Store) -> Result<(), Box<dyn std::error::Error + Send + 
     let mut lifecycle = LifecycleReader::new(rx);
     let mut compacted: HashMap<String, Frame> = HashMap::new();
     let mut active: HashMap<String, Action> = HashMap::new();
+    let mut in_flight = tokio::task::JoinSet::new();
 
     while let Some(event) = lifecycle.recv().await {
         match event {
@@ -257,6 +258,10 @@ pub async fn run(store: Store) -> Result<(), Box<dyn std::error::Error + Send + 
                 }
             }
             Lifecycle::Live(frame) => {
+                if frame.topic == "xs.stopping" {
+                    break;
+                }
+
                 if let Some(name) = frame.topic.strip_suffix(".define") {
                     handle_define(&frame, name, &store, &mut active).await;
                 } else if let Some(name) = frame.topic.strip_suffix(".call") {
@@ -265,7 +270,7 @@ pub async fn run(store: Store) -> Result<(), Box<dyn std::error::Error + Send + 
                         let store = store.clone();
                         let frame = frame.clone();
                         let action = action.clone();
-                        tokio::spawn(async move {
+                        in_flight.spawn(async move {
                             if let Err(e) = execute_action(action, &frame, &store).await {
                                 tracing::error!("Failed to execute action '{}': {:?}", name, e);
                                 let _ = store.append(
@@ -282,6 +287,9 @@ pub async fn run(store: Store) -> Result<(), Box<dyn std::error::Error + Send + 
             }
         }
     }
+
+    // Drain in-flight action executions
+    while in_flight.join_next().await.is_some() {}
 
     Ok(())
 }
